@@ -1,0 +1,42 @@
+# Architecture review findings — 2026-10-19
+
+Reviewed `ARCHITECTURE-REVIEW.md` against the implementation. This is a focused correctness review, not a complete security audit. The original review pack describes the pre-fix implementation; the fixes below supersede those sections.
+
+## Fixed
+
+1. **High — chunk completion could persist unflushed progress from other lanes.** In `DownloadEngine.completeChunk`, `writer.snapshot()` ran after `fsync` and the read-back hash. Other lanes could write during that interval, so persisted offsets included bytes not covered by the flush. Capture counters before syncing, then exclude completed chunks from that snapshot. This restores the intended ordering; it does not establish power-loss durability of the state-file rename itself. Checked by inspection of the ordering and the existing concurrent download/resume checks; no simulated power-loss test.
+2. **High — cancelling verification could still finalize the file.** Detached hashing did not inherit cancellation, and `finish` never checked cancellation before moving the file. Forward cancellation to full-file and repair hash tasks, check before finalization, and check cancellation in SHA1/range hash loops. Advance repair stage only after its scan completes, so cancelling that scan does not consume a repair attempt. Regression checks cancel exactly when verification begins, verify the part remains, and resume without fetching completed bytes again; all hash variants are checked for cancellation.
+3. **High — malformed HTTP framing could terminate the web process.** Negative `Content-Length` reached `Data.prefix`, whose length must be nonnegative. The parser now accepts only ASCII decimal lengths within its 1 MiB cap and rejects unsupported transfer encodings. Smoke checks cover negative, malformed, overflowing, and oversized lengths and confirm the server survives each request. Host checks occur after parsing, so the Host defence alone could not prevent this crash.
+4. **Medium — delayed macOS progress callbacks could overwrite terminal status.** Callbacks now carry a per-run UUID; completion invalidates it and reconstructs the final progress snapshot from the returned state. Old callbacks cannot overwrite a completed or subsequent run. Compiled with the application; interactive SwiftUI validation remains manual.
+
+## Remaining actionable findings
+
+1. **High — part-file names are not reserved atomically** (`Engine.cycle`, `uniqueName`, `preparePart`). Two engines can choose the same unused name, then suspend at `probe` before creating the part. Both subsequently write the same path. Different files with the same basename are sufficient; duplicate-source rejection does not prevent this. Use job-ID-specific part paths (with migration for existing jobs), or exclusive file creation with collision retry. Whole-file verification reduces the chance of publishing bad data but does not make concurrent writes safe, especially for unverified sources.
+2. **High — final rename and persisted completion are not recoverable as one operation** (`Engine.finish`, `persist`, `StateStore.save`). A crash after moving the part but before saving `done` leaves an active state pointing to a missing part; the next run creates a fresh part and downloads again. Save failures are only logged, including the initial selected filename and final status. Introduce a durable finalization intent and restart reconciliation, propagate persistence failures, and test fault injection at each transition. Atomic JSON replacement alone does not prove directory-entry durability on power loss.
+3. **High — server-controlled filenames are not constrained to basenames** (`CivitaiResolver.resolve`, `Engine.uniqueName`). Civitai's `file.name` flows directly into destination path construction. Reject separators, dot/dot-dot names, and control characters before path construction; validate loaded state as well. A malformed or compromised metadata response must not escape the selected folder. This is a missing validation boundary, not evidence of malicious upstream responses.
+4. **Medium — pause while offline can hang** (`NetworkMonitor.waitUntilOnline`). The continuation is resumed only when connectivity returns; cancellation does not remove/resume it. Pause, remove, and restart can wait indefinitely with no network. Store waiters by ID and make registration/cancellation race-safe; test cancel-before-registration and cancel-after-registration.
+5. **Medium — range probes/resolver requests can buffer an entire model** (`URLSessionFetcher.probe`, `NoRedirect.send`). `Range: bytes=0-0` is only a request; a server can ignore it and return 200 with the full body. `dlData` buffers that body before status validation. Use a response delegate that validates headers and cancels/discards the body immediately, with a bounded body reader for API JSON. The review pack's claim that GET Range bounds responses to one byte is incorrect.
+6. **Medium — Civitai can select metadata for a different file than it downloads** (`CivitaiResolver.resolve`). Query-string equality is order-sensitive; a semantically identical reordered query can miss the match and fall back to the primary file, while the actual request still uses the explicit URL. This can attach the wrong filename/hash and waste a full repair download. Match normalized selection parameters and reject ambiguous explicit selections instead of silently falling back.
+
+### Status update — 2026-10-19 (second pass, after review)
+
+Remaining findings 1–4 are fixed; 5–6 stay open.
+
+| # | Fix | Checks (`DLChecks`) |
+|---|---|---|
+| 3 | `FileNames.safe` sanitises every server name in one place (`Engine.cycle`): separators `/ \ :`, control chars → `_`, leading dots stripped (no `.`/`..`/hidden), ≤200 UTF-8 bytes, empty → `unsafeFileName` (fatal). Loaded state is validated at `run()` (`JobState.namesAreSafe`). | `../../escape.bin` saved inside the folder, nothing outside; unsafe name in saved state refused; unit vectors. |
+| 1 | Part file reserved with `open(O_CREAT\|O_EXCL)` when the name is chosen; name persisted as `partFileName` (old states fall back to `<fileName>.dlpart`). If our part file disappears, the job re-reserves a fresh name and starts over instead of re-creating a path another job may own. | Two concurrent jobs, same server name, different content → `same.bin` + `same (1).bin`, each with its own bytes. |
+| 2 | Durable finalize intent: `finalizing = true` + target name saved (state write + directory fsync, errors propagate) before publishing. Publish = `link(part, final)` (fails atomically if the name exists) + `unlink(part)`; on file systems without hard links → `renamex_np(RENAME_EXCL)` on macOS, check-then-`rename` on Linux. `run()` reconciles an interrupted finalize before anything else. Critical transitions use `persistOrThrow` (name reserved, intent, done). | Crash simulations: (a) final present/part gone, (b) part and final hard-linked, (c) only part present, (d) final name taken by another file → done with 0 bytes downloaded, other file untouched, ours under a new name. State dir unwritable → job fails instead of continuing silently. |
+| 4 | `CancellableWaiters` (UUID-keyed continuations, cancel-before-registration set). `NetworkMonitor.waitUntilOnline` returns on cancellation. | cancel before / after registration, no waiter leak, resumeAll; engine waiting offline → pause returns within 2 s with status `paused`. |
+
+Caveats: directory fsync is best effort and plain `fsync` (no `F_FULLFSYNC` on macOS); Linux no-hard-link fallback has a small check-then-rename window; a deleted part file now means starting that download over (by design).
+
+The "only verified files get their final name" statement in the original pack also needs qualification: the implementation deliberately finalizes files with no source hash or with verification disabled. Those files receive `verified = false`.
+
+## Validation
+
+- All three executable targets built with Swift 5.10 on macOS, using temporary build/module caches.
+- `DLChecks`: all checks passed, including seven new cancellation/resume assertions.
+- `sh -n scripts/web-smoke.sh`: passed.
+- Live HTTP regression execution was attempted but blocked by the sandbox: binding the loopback socket returned `Operation not permitted`. The added HTTP smoke checks still need execution in the Linux build environment.
+- No installed application or distribution archive was replaced. Linux compilation and interactive macOS UI checks were not run.
